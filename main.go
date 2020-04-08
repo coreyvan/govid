@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"math"
@@ -20,7 +21,7 @@ func main() {
 	var numUploaders int = 10
 	var batchSize int = 50
 
-	points, err := readDatapoints("us.data", 3000)
+	points, err := readDatapoints("us.data", 100)
 	if err != nil {
 		log.Fatal("could not read file", err)
 	}
@@ -90,6 +91,7 @@ func main() {
 }
 
 type datapoint struct {
+	// ID           string    `json:"id"`
 	Ts           time.Time `json:"@timestamp"`
 	CountryName  string    `json:"country_name"`
 	CountryCode  string    `json:"country_code"`
@@ -175,9 +177,11 @@ func readDatapoints(f string, n int) ([]datapoint, error) {
 
 			points[i].ProvinceCode = "US-" + pCode.Code
 		}
+
+		// assignID(&points[i])
 	}
 
-	return points[:n], nil
+	return points, nil
 }
 
 func uploadPoints(ec *elasticsearch.Client, p *[]datapoint, idx string) (int, error) {
@@ -209,9 +213,49 @@ type batch struct {
 }
 
 func bulkUploader(queue chan batch, wid int, ec *elasticsearch.Client, done chan bool) {
+	var buf bytes.Buffer
+	var raw map[string]interface{}
 	for {
 		batch := <-queue
+		for _, e := range batch.Payload {
+			meta := []byte(fmt.Sprintf(`{ "index" : { "_index": "covid" } }%s`, "\n"))
+			data, err := json.Marshal(e)
+			if err != nil {
+				log.Printf("Worker %d: could not marshal json: %v ... skipping", wid, err)
+				continue
+			}
+			data = append(data, "\n"...)
+
+			buf.Grow(len(meta) + len(data))
+			buf.Write(meta)
+			buf.Write(data)
+		}
 		log.Printf("Uploading batch %d of %d records\n", batch.ID, len(batch.Payload))
+
+		res, err := ec.Bulk(bytes.NewReader(buf.Bytes()), ec.Bulk.WithIndex("covid"))
+		if err != nil {
+			log.Printf("Failure indexing batch %d: %s", batch.ID, err)
+			done <- true
+			continue
+		}
+		defer res.Body.Close()
+
+		if res.IsError() {
+			if err := json.NewDecoder(res.Body).Decode(&raw); err != nil {
+				log.Printf("Failure to to parse response body: %s", err)
+				done <- true
+				continue
+			} else {
+				log.Printf("  Error: [%d] %s: %s",
+					res.StatusCode,
+					raw["error"].(map[string]interface{})["type"],
+					raw["error"].(map[string]interface{})["reason"],
+				)
+				done <- true
+				continue
+			}
+		}
+		buf.Reset()
 		done <- true
 	}
 }
@@ -219,4 +263,9 @@ func bulkUploader(queue chan batch, wid int, ec *elasticsearch.Client, done chan
 func timeTaken(t time.Time, n int) {
 	elapsed := time.Since(t)
 	log.Printf("Num uploaders: %d\t\t%s\n", n, elapsed)
+}
+
+func assignID(d *datapoint) error {
+	// d.ID = fmt.Sprintf("%d%d%d-%s-%s-%s\n", d.Ts.Year(), d.Ts.Month(), d.Ts.Day(), d.CountryCode, d.ProvinceCode, d.CityCode)
+	return nil
 }
